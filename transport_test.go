@@ -191,8 +191,18 @@ func TestTypedErrors(t *testing.T) {
 		t.Fatalf("details: %+v", e)
 	}
 	c, _, _ = fakeClient(t, []reply{apiErr(409, "idempotency_key_reused", nil)})
-	if _, err := c.Transfers.Create(ctx, TransferParams{SourceAccountID: "a", DestinationAccountID: "b", AmountMinor: 9}); !errors.Is(err, ErrConflict) {
+	if _, err := c.Transfers.Create(ctx, TransferParams{SourceAccountID: "a", DestinationAccountID: "b", AmountMinor: 9}); !errors.Is(err, ErrConflict) || errors.Is(err, ErrFeeChanged) {
 		t.Fatalf("conflict: %v", err)
+	}
+	max := int64(60)
+	c, rt, _ := fakeClient(t, []reply{apiErr(409, "fee_changed", map[string]any{"fees_total_minor": 70})})
+	_, err = c.Transfers.Create(ctx, TransferParams{SourceAccountID: "a", DestinationAccountID: "b", AmountMinor: 9, MaxFeeMinor: &max})
+	if !errors.Is(err, ErrFeeChanged) || !errors.Is(err, ErrConflict) {
+		t.Fatalf("fee_changed: %v", err)
+	}
+	body, _ := io.ReadAll(rt.calls[0].Body)
+	if !strings.Contains(string(body), `"max_fee_minor":60`) {
+		t.Fatalf("max_fee_minor not sent: %s", body)
 	}
 }
 

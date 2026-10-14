@@ -77,10 +77,21 @@ func (s *GamesService) Get(ctx context.Context, gameID string, opts ...RequestOp
 	return &out, s.t.do(ctx, op{method: http.MethodGet, path: path("/v1/games/%s", gameID)}, &out, opts)
 }
 
+// Update renames a game, changes its slug, or suspends or reactivates it.
+func (s *GamesService) Update(ctx context.Context, gameID string, p UpdateGameParams, opts ...RequestOption) (*Game, error) {
+	var out Game
+	return &out, s.t.do(ctx, op{method: http.MethodPatch, path: path("/v1/games/%s", gameID), body: p}, &out, opts)
+}
+
 // SetStatus suspends or reactivates a game ("active" or "suspended").
 func (s *GamesService) SetStatus(ctx context.Context, gameID, status string, opts ...RequestOption) (*Game, error) {
-	var out Game
-	return &out, s.t.do(ctx, op{method: http.MethodPatch, path: path("/v1/games/%s", gameID), body: map[string]string{"status": status}}, &out, opts)
+	return s.Update(ctx, gameID, UpdateGameParams{Status: status}, opts...)
+}
+
+// Delete deletes a game permanently: its API keys are revoked at once and it
+// leaves the developer API. Ledger and audit history are kept.
+func (s *GamesService) Delete(ctx context.Context, gameID string, opts ...RequestOption) error {
+	return s.t.do(ctx, op{method: http.MethodDelete, path: path("/v1/games/%s", gameID)}, nil, opts)
 }
 
 type APIKeysService struct{ t *transport }

@@ -20,7 +20,7 @@ import (
 )
 
 // Version is the SDK version.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // ResponseInfo is passed to the response hook after every HTTP response, including retried ones.
 type ResponseInfo struct {

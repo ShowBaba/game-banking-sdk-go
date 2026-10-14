@@ -43,6 +43,27 @@ for line, err := range gb.Accounts.IterateTransactions(ctx, account.ID, 50) {
 
 Every call takes a `context.Context`. Errors are a single `*gamebank.Error`; test categories with `errors.Is(err, gamebank.ErrNotFound)` and friends, and read fields with `gamebank.AsError`.
 
+## Fees and charges
+
+```go
+// Show the player what the transfer costs, then cap the fee at what they saw.
+q, err := gb.Fees.Quote(ctx, gamebank.QuoteFeesParams{BankID: bankID, AmountMinor: 2_000_00})
+quoted := q.FeesTotalMinor
+r, err := gb.Transfers.Create(ctx, gamebank.TransferParams{SourceAccountID: account.ID,
+	DestinationAccountNumber: "5915945174", AmountMinor: 2_000_00, MaxFeeMinor: &quoted})
+if errors.Is(err, gamebank.ErrFeeChanged) {
+	// the schedule changed: quote again
+}
+fmt.Println(r.Fees, r.TotalDebitMinor) // each fee is its own ledger and statement line
+
+// Configure fees (bank:write): ₦50 + 1%, capped at ₦500, on transfers of ₦1,000 or more.
+feeCap, fromAmount := int64(500_00), int64(1_000_00)
+_, err = gb.Fees.Create(ctx, bankID, gamebank.CreateFeeRuleParams{Code: "transfer_fee", Name: "Transfer fee",
+	Event: gamebank.FeeEventTransfer, Model: gamebank.FeeModelCombined, FixedMinor: 50_00, PercentageBPS: 100,
+	MaxFeeMinor: &feeCap, MinAmountMinor: &fromAmount})
+books, err := gb.Banks.Books(ctx, bankID) // FeeIncomeMinor, LeviesPayableMinor
+```
+
 ## Setup and CI
 
 ```go
@@ -52,6 +73,8 @@ key, _ := mgmt.APIKeys.Issue(ctx, game.ID, gamebank.IssueAPIKeyParams{Environmen
 fmt.Println(key.Secret) // shown once
 _, _ = mgmt.Game(game.ID, "sandbox").Banks.Create(ctx, gamebank.CreateBankParams{Name: "Eko Trust Bank", BaseCurrency: "NGN"})
 ```
+
+`mgmt.Games.Update(ctx, id, gamebank.UpdateGameParams{...})` renames or suspends a game; `mgmt.Games.Delete(ctx, id)` deletes it and revokes its keys.
 
 ## Behaviour
 

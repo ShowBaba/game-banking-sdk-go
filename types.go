@@ -89,6 +89,10 @@ type Entry struct {
 	Side          string `json:"side"`
 	AmountMinor   int64  `json:"amount_minor"`
 	BalanceAfter  int64  `json:"balance_after"`
+	// Kind is "principal", "fee" or "levy". Fee and levy lines carry the rule and its name.
+	Kind        string `json:"kind"`
+	FeeRuleID   string `json:"fee_rule_id,omitempty"`
+	Description string `json:"description,omitempty"`
 }
 
 type Transaction struct {
@@ -127,15 +131,17 @@ type Counterparty struct {
 // HistoryItem is one line of an account's statement. Direction is "debit"
 // or "credit" from the account holder's point of view.
 type HistoryItem struct {
-	EntryID              string        `json:"entry_id"`
-	TransactionID        string        `json:"transaction_id"`
-	SessionID            string        `json:"session_id"`
-	Type                 string        `json:"type"`
-	Status               string        `json:"status"`
-	Direction            string        `json:"direction"`
-	AmountMinor          int64         `json:"amount_minor"`
-	AmountDisplay        string        `json:"amount_display"`
-	BalanceAfter         int64         `json:"balance_after"`
+	EntryID       string `json:"entry_id"`
+	TransactionID string `json:"transaction_id"`
+	SessionID     string `json:"session_id"`
+	Type          string `json:"type"`
+	Status        string `json:"status"`
+	Direction     string `json:"direction"`
+	AmountMinor   int64  `json:"amount_minor"`
+	AmountDisplay string `json:"amount_display"`
+	BalanceAfter  int64  `json:"balance_after"`
+	// Kind is "principal", "fee" or "levy". A fee or levy line's narration is the fee's name.
+	Kind                 string        `json:"kind"`
 	Narration            *string       `json:"narration"`
 	Reference            *string       `json:"reference"`
 	Counterparty         *Counterparty `json:"counterparty"`
@@ -152,11 +158,13 @@ type HistoryPage struct {
 }
 
 type Hold struct {
-	ID                   string     `json:"id"`
-	BankID               string     `json:"bank_id"`
-	AccountID            string     `json:"account_id"`
-	DestinationAccountID *string    `json:"destination_account_id"`
-	AmountMinor          int64      `json:"amount_minor"`
+	ID                   string  `json:"id"`
+	BankID               string  `json:"bank_id"`
+	AccountID            string  `json:"account_id"`
+	DestinationAccountID *string `json:"destination_account_id"`
+	AmountMinor          int64   `json:"amount_minor"`
+	// ReservedFeeMinor is held on top of the amount for the capture's expected fees.
+	ReservedFeeMinor     int64      `json:"reserved_fee_minor"`
 	CapturedAmountMinor  *int64     `json:"captured_amount_minor"`
 	Status               string     `json:"status"`
 	Reason               string     `json:"reason"`
@@ -226,6 +234,11 @@ type TransferResult struct {
 	Transaction        Transaction `json:"transaction"`
 	SourceBalance      Balance     `json:"source_balance"`
 	DestinationBalance *Balance    `json:"destination_balance,omitempty"`
+	// Fees and levies charged to the sender on top of the amount.
+	Fees           []FeeCharge `json:"fees"`
+	FeesTotalMinor int64       `json:"fees_total_minor"`
+	// TotalDebitMinor is the amount plus fees.
+	TotalDebitMinor int64 `json:"total_debit_minor"`
 }
 
 type HoldResult struct {
@@ -238,6 +251,9 @@ type CaptureResult struct {
 	Transaction        Transaction `json:"transaction"`
 	SourceBalance      Balance     `json:"source_balance"`
 	DestinationBalance *Balance    `json:"destination_balance,omitempty"`
+	Fees               []FeeCharge `json:"fees"`
+	FeesTotalMinor     int64       `json:"fees_total_minor"`
+	TotalDebitMinor    int64       `json:"total_debit_minor"`
 }
 
 type AdvanceClockResult struct {
@@ -302,6 +318,9 @@ type TransferParams struct {
 	Reference                string         `json:"reference,omitempty"`
 	Narration                string         `json:"narration,omitempty"`
 	Metadata                 map[string]any `json:"metadata,omitempty"`
+	// MaxFeeMinor, when set, refuses the transfer with ErrFeeChanged if its fees
+	// now total more, e.g. the FeesTotalMinor of a quote the player accepted.
+	MaxFeeMinor *int64 `json:"max_fee_minor,omitempty"`
 }
 
 type PlaceHoldParams struct {
@@ -313,6 +332,8 @@ type PlaceHoldParams struct {
 	DestinationAccountNumber string     `json:"destination_account_number,omitempty"`
 	ExpiresAtGame            *time.Time `json:"expires_at_game,omitempty"`
 	ExpiresInGameSeconds     int64      `json:"expires_in_game_seconds,omitempty"`
+	// MaxFeeMinor caps the capture fee reserved now (ErrFeeChanged if higher).
+	MaxFeeMinor *int64 `json:"max_fee_minor,omitempty"`
 }
 
 type CaptureHoldParams struct {
@@ -323,6 +344,8 @@ type CaptureHoldParams struct {
 	Narration                string         `json:"narration,omitempty"`
 	Reference                string         `json:"reference,omitempty"`
 	Metadata                 map[string]any `json:"metadata,omitempty"`
+	// MaxFeeMinor refuses the capture with ErrFeeChanged if its fees now total more.
+	MaxFeeMinor *int64 `json:"max_fee_minor,omitempty"`
 }
 
 type ReverseParams struct {
@@ -366,6 +389,138 @@ type AdvanceClockParams struct {
 	Hours   int64      `json:"hours,omitempty"`
 	Days    int64      `json:"days,omitempty"`
 	To      *time.Time `json:"to,omitempty"`
+}
+
+// ---- fees and charges ----
+
+// Fee events, kinds, models and states.
+const (
+	FeeEventTransfer           = "transfer"
+	FeeEventHoldCapture        = "hold_capture"
+	FeeEventAccountMaintenance = "account_maintenance"
+
+	FeeKindFee  = "fee"  // credits the bank's fee_income account
+	FeeKindLevy = "levy" // credits levies_payable: money held for someone else
+
+	FeeModelFixed      = "fixed"
+	FeeModelPercentage = "percentage"
+	FeeModelCombined   = "combined"
+
+	FeeStateInEffect  = "in_effect"
+	FeeStateScheduled = "scheduled"
+	FeeStateEnded     = "ended"
+	FeeStateInactive  = "inactive"
+)
+
+// FeeRule is a fee or levy a bank charges. Amounts are minor units; times are game time.
+type FeeRule struct {
+	ID             string     `json:"id"`
+	BankID         string     `json:"bank_id"`
+	Code           string     `json:"code"`
+	Name           string     `json:"name"`
+	Event          string     `json:"event"`
+	Kind           string     `json:"kind"`
+	Model          string     `json:"model"`
+	FixedMinor     int64      `json:"fixed_minor"`
+	PercentageBPS  int64      `json:"percentage_bps"` // 100 = 1%
+	MinFeeMinor    *int64     `json:"min_fee_minor"`
+	MaxFeeMinor    *int64     `json:"max_fee_minor"`
+	MinAmountMinor *int64     `json:"min_amount_minor"`
+	MaxAmountMinor *int64     `json:"max_amount_minor"`
+	Payer          string     `json:"payer"`
+	CreditAccount  string     `json:"credit_account"`
+	Status         string     `json:"status"`
+	EffectiveFrom  time.Time  `json:"effective_from"`
+	EffectiveTo    *time.Time `json:"effective_to"`
+	Version        int        `json:"version"`
+	// State is where the rule stands at the current game time; only in_effect rules charge.
+	State     string    `json:"state"`
+	Warnings  []string  `json:"warnings"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// CreateFeeRuleParams adds a fee. Leave optional pointers nil for "no limit".
+type CreateFeeRuleParams struct {
+	Code           string     `json:"code"`
+	Name           string     `json:"name"`
+	Event          string     `json:"event"`
+	Model          string     `json:"model"`
+	Kind           string     `json:"kind,omitempty"`
+	FixedMinor     int64      `json:"fixed_minor,omitempty"`
+	PercentageBPS  int64      `json:"percentage_bps,omitempty"`
+	MinFeeMinor    *int64     `json:"min_fee_minor,omitempty"`
+	MaxFeeMinor    *int64     `json:"max_fee_minor,omitempty"`
+	MinAmountMinor *int64     `json:"min_amount_minor,omitempty"`
+	MaxAmountMinor *int64     `json:"max_amount_minor,omitempty"`
+	Status         string     `json:"status,omitempty"`
+	EffectiveFrom  *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo    *time.Time `json:"effective_to,omitempty"`
+	// StartNow starts the fee at the current game time.
+	StartNow bool `json:"start_now,omitempty"`
+}
+
+// UpdateFeeRuleParams changes a fee; nil fields keep their value. Clear resets
+// fields to "no limit", e.g. []string{"max_fee_minor"}.
+type UpdateFeeRuleParams struct {
+	Name           *string    `json:"name,omitempty"`
+	Kind           *string    `json:"kind,omitempty"`
+	Model          *string    `json:"model,omitempty"`
+	FixedMinor     *int64     `json:"fixed_minor,omitempty"`
+	PercentageBPS  *int64     `json:"percentage_bps,omitempty"`
+	MinFeeMinor    *int64     `json:"min_fee_minor,omitempty"`
+	MaxFeeMinor    *int64     `json:"max_fee_minor,omitempty"`
+	MinAmountMinor *int64     `json:"min_amount_minor,omitempty"`
+	MaxAmountMinor *int64     `json:"max_amount_minor,omitempty"`
+	Status         *string    `json:"status,omitempty"`
+	EffectiveFrom  *time.Time `json:"effective_from,omitempty"`
+	EffectiveTo    *time.Time `json:"effective_to,omitempty"`
+	StartNow       bool       `json:"start_now,omitempty"`
+	Clear          []string   `json:"clear,omitempty"`
+}
+
+// FeeCharge is one fee or levy charged on a payment.
+type FeeCharge struct {
+	FeeRuleID      string `json:"fee_rule_id"`
+	FeeRuleVersion int    `json:"fee_rule_version"`
+	Code           string `json:"code"`
+	Name           string `json:"name"`
+	Kind           string `json:"kind"`
+	AmountMinor    int64  `json:"amount_minor"`
+	CreditAccount  string `json:"credit_account"`
+}
+
+// QuoteFeesParams asks what a transfer (default) or hold capture would cost.
+type QuoteFeesParams struct {
+	BankID      string `json:"bank_id"`
+	AmountMinor int64  `json:"amount_minor"`
+	Event       string `json:"event,omitempty"`
+}
+
+type FeeQuote struct {
+	BankID          string      `json:"bank_id"`
+	Event           string      `json:"event"`
+	AmountMinor     int64       `json:"amount_minor"`
+	Fees            []FeeCharge `json:"fees"`
+	FeesTotalMinor  int64       `json:"fees_total_minor"`
+	TotalDebitMinor int64       `json:"total_debit_minor"`
+	GameTime        time.Time   `json:"game_time"`
+}
+
+// BankBooks is the bank's own ledger, from which its profit and loss derives.
+type BankBooks struct {
+	BankID             string `json:"bank_id"`
+	Currency           string `json:"currency"`
+	FeeIncomeMinor     int64  `json:"fee_income_minor"`
+	LeviesPayableMinor int64  `json:"levies_payable_minor"`
+	Accounts           []struct {
+		SystemRole     string `json:"system_role"`
+		AccountName    string `json:"account_name"`
+		AccountNumber  string `json:"account_number"`
+		BalanceMinor   int64  `json:"balance_minor"`
+		BalanceDisplay string `json:"balance_display"`
+	} `json:"accounts"`
+	AsOf time.Time `json:"as_of"`
 }
 
 // ---- management ----
@@ -429,6 +584,13 @@ type AuditLog struct {
 	CorrelationID *string        `json:"correlation_id"`
 	Metadata      map[string]any `json:"metadata"`
 	CreatedAt     time.Time      `json:"created_at"`
+}
+
+// UpdateGameParams renames a game or changes its slug or status; empty fields keep their value.
+type UpdateGameParams struct {
+	Name   string `json:"name,omitempty"`
+	Slug   string `json:"slug,omitempty"`
+	Status string `json:"status,omitempty"`
 }
 
 type IssueAPIKeyParams struct {

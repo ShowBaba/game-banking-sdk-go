@@ -42,6 +42,7 @@ type Client struct {
 	Holds        *HoldsService
 	Transactions *TransactionsService
 	Banks        *BanksService
+	Fees         *FeesService
 	Currencies   *CurrenciesService
 	Clock        *ClockService
 }
@@ -60,7 +61,7 @@ func newClient(t *transport) *Client {
 		t: t, Environment: t.environment,
 		Players: &PlayersService{t}, Accounts: &AccountsService{t}, Funding: &FundingService{t},
 		Transfers: &TransfersService{t}, Holds: &HoldsService{t}, Transactions: &TransactionsService{t},
-		Banks: &BanksService{t}, Currencies: &CurrenciesService{t}, Clock: &ClockService{t},
+		Banks: &BanksService{t}, Fees: &FeesService{t}, Currencies: &CurrenciesService{t}, Clock: &ClockService{t},
 	}
 }
 
@@ -283,10 +284,52 @@ func (s *BanksService) Limits(ctx context.Context, bankID string, opts ...Reques
 	return &out, s.t.do(ctx, op{method: http.MethodGet, path: path("/v1/banks/%s/limits", bankID)}, &out, opts)
 }
 
+// Books returns the bank's own ledger accounts: fee income earned and levies held.
+func (s *BanksService) Books(ctx context.Context, bankID string, opts ...RequestOption) (*BankBooks, error) {
+	var out BankBooks
+	return &out, s.t.do(ctx, op{method: http.MethodGet, path: path("/v1/banks/%s/books", bankID)}, &out, opts)
+}
+
 // SetLimits sets caps per scope (ScopePlayerFunding, …); a nil policy removes that scope's limits. Needs limits:write.
 func (s *BanksService) SetLimits(ctx context.Context, bankID string, limits map[string]*LimitPolicy, opts ...RequestOption) (*Limits, error) {
 	var out Limits
 	return &out, s.t.do(ctx, op{method: http.MethodPut, path: path("/v1/banks/%s/limits", bankID), body: limits}, &out, opts)
+}
+
+// FeesService manages a bank's fees and levies and quotes them.
+type FeesService struct{ t *transport }
+
+// List returns a bank's fee rules, active and inactive, each with its current State.
+func (s *FeesService) List(ctx context.Context, bankID string, opts ...RequestOption) ([]FeeRule, error) {
+	var out struct{ Data []FeeRule }
+	return out.Data, s.t.do(ctx, op{method: http.MethodGet, path: path("/v1/banks/%s/fees", bankID)}, &out, opts)
+}
+
+func (s *FeesService) Get(ctx context.Context, bankID, feeID string, opts ...RequestOption) (*FeeRule, error) {
+	var out FeeRule
+	return &out, s.t.do(ctx, op{method: http.MethodGet, path: path("/v1/banks/%s/fees/%s", bankID, feeID)}, &out, opts)
+}
+
+// Create adds a fee or levy. Needs bank:write.
+func (s *FeesService) Create(ctx context.Context, bankID string, p CreateFeeRuleParams, opts ...RequestOption) (*FeeRule, error) {
+	var out FeeRule
+	return &out, s.t.do(ctx, op{method: http.MethodPost, path: path("/v1/banks/%s/fees", bankID), body: p}, &out, opts)
+}
+
+// Update changes, pauses (Status "inactive") or resumes a fee and bumps its version. Needs bank:write.
+func (s *FeesService) Update(ctx context.Context, bankID, feeID string, p UpdateFeeRuleParams, opts ...RequestOption) (*FeeRule, error) {
+	var out FeeRule
+	return &out, s.t.do(ctx, op{method: http.MethodPatch, path: path("/v1/banks/%s/fees/%s", bankID, feeID), body: p}, &out, opts)
+}
+
+// Quote returns what a transfer or hold capture would cost now. Show it to the
+// player, then pass FeesTotalMinor as MaxFeeMinor on the payment.
+func (s *FeesService) Quote(ctx context.Context, p QuoteFeesParams, opts ...RequestOption) (*FeeQuote, error) {
+	if err := checkAmount(p.AmountMinor, true); err != nil {
+		return nil, err
+	}
+	var out FeeQuote
+	return &out, s.t.do(ctx, op{method: http.MethodPost, path: "/v1/fees/quote", body: p}, &out, opts)
 }
 
 type CurrenciesService struct{ t *transport }

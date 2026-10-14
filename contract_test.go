@@ -75,7 +75,7 @@ func TestContract(t *testing.T) {
 	}
 	bank, err := mgmt.Game(game.ID, "sandbox").Banks.Create(ctx, gamebank.CreateBankParams{Name: "Eko Trust Bank", BaseCurrency: "NGN"})
 	must(err)
-	if len(bank.SystemAccounts) != 7 {
+	if len(bank.SystemAccounts) != 8 { // incl. levies_payable
 		t.Fatalf("system accounts: %d", len(bank.SystemAccounts))
 	}
 	readOnly, err := mgmt.APIKeys.Issue(ctx, game.ID, gamebank.IssueAPIKeyParams{Environment: "sandbox", Scopes: []string{gamebank.ScopeAccountRead}})
@@ -148,7 +148,7 @@ func TestContract(t *testing.T) {
 
 	held, err := gb.Holds.Place(ctx, gamebank.PlaceHoldParams{AccountID: adaAcct.ID, AmountMinor: 3_000_00, Reason: "Order #1", DestinationAccountID: tundeAcct.ID})
 	must(err)
-	if held.Balance.PostedBalance != 7_500_00 || held.Balance.AvailableBalance != 4_500_00 {
+	if held.Balance.PostedBalance != 7_500_00 || held.Balance.AvailableBalance != 4_500_00 || held.Hold.ReservedFeeMinor != 0 {
 		t.Fatalf("hold balance %+v", held.Balance)
 	}
 	capt, err := gb.Holds.Capture(ctx, held.Hold.ID, gamebank.CaptureHoldParams{AmountMinor: 2_000_00})
@@ -188,6 +188,73 @@ func TestContract(t *testing.T) {
 		t.Fatalf("reversal %s / %s", rev.Type, orig.Status)
 	}
 
+	// Fees: a ₦50 + 1% transfer fee (max ₦500) via the developer credential, a levy via the game key.
+	i64 := func(v int64) *int64 { return &v }
+	cfg := mgmt.Game(game.ID, "sandbox")
+	fee, err := cfg.Fees.Create(ctx, bank.ID, gamebank.CreateFeeRuleParams{Code: "transfer_fee", Name: "Transfer fee",
+		Event: gamebank.FeeEventTransfer, Model: gamebank.FeeModelCombined, FixedMinor: 50_00, PercentageBPS: 100, MaxFeeMinor: i64(500_00)})
+	must(err)
+	if fee.State != gamebank.FeeStateInEffect || fee.CreditAccount != "fee_income" {
+		t.Fatalf("fee: %+v", fee)
+	}
+	levy, err := gb.Fees.Create(ctx, bank.ID, gamebank.CreateFeeRuleParams{Code: "stamp_duty", Name: "Stamp duty", Event: gamebank.FeeEventTransfer,
+		Kind: gamebank.FeeKindLevy, Model: gamebank.FeeModelFixed, FixedMinor: 50_00, MinAmountMinor: i64(10_000_00)})
+	must(err)
+	if levy.CreditAccount != "levies_payable" {
+		t.Fatalf("levy: %+v", levy)
+	}
+	if rules, err := gb.Fees.List(ctx, bank.ID); err != nil || len(rules) != 2 {
+		t.Fatalf("list: %v %d", err, len(rules))
+	}
+	quote, err := gb.Fees.Quote(ctx, gamebank.QuoteFeesParams{BankID: bank.ID, AmountMinor: 1_000_00})
+	must(err)
+	if quote.FeesTotalMinor != 60_00 {
+		t.Fatalf("quote: %+v", quote)
+	}
+	before, err := gb.Accounts.Balance(ctx, adaAcct.ID)
+	must(err)
+	pay := gamebank.TransferParams{SourceAccountID: adaAcct.ID, DestinationAccountID: tundeAcct.ID, AmountMinor: 1_000_00, MaxFeeMinor: i64(quote.FeesTotalMinor)}
+	paid, err := gb.Transfers.Create(ctx, pay)
+	must(err)
+	if paid.FeesTotalMinor != 60_00 || paid.TotalDebitMinor != 1_060_00 || paid.SourceBalance.PostedBalance != before.PostedBalance-1_060_00 {
+		t.Fatalf("paid: fees %d total %d balance %d", paid.FeesTotalMinor, paid.TotalDebitMinor, paid.SourceBalance.PostedBalance)
+	}
+	kinds := map[string]int{}
+	for _, e := range paid.Transaction.Entries {
+		kinds[e.Kind]++
+	}
+	if kinds["principal"] != 2 || kinds["fee"] != 2 {
+		t.Fatalf("entry kinds %v", kinds)
+	}
+	latest, err := gb.Accounts.Transactions(ctx, adaAcct.ID, 2, "")
+	must(err)
+	labelled := false
+	for _, l := range latest.Data {
+		labelled = labelled || (l.Kind == "fee" && l.Narration != nil && *l.Narration == "Transfer fee")
+	}
+	if !labelled {
+		t.Fatal("the fee should be its own labelled statement line")
+	}
+	_, err = cfg.Fees.Update(ctx, bank.ID, fee.ID, gamebank.UpdateFeeRuleParams{FixedMinor: i64(60_00)})
+	must(err)
+	if _, err := gb.Transfers.Create(ctx, pay); !errors.Is(err, gamebank.ErrFeeChanged) || !errors.Is(err, gamebank.ErrConflict) {
+		t.Fatalf("fee_changed: %v", err)
+	}
+	books, err := gb.Banks.Books(ctx, bank.ID)
+	must(err)
+	if books.FeeIncomeMinor != 60_00 {
+		t.Fatalf("books: %+v", books)
+	}
+	_, err = gb.Transactions.Reverse(ctx, paid.Transaction.ID, gamebank.ReverseParams{Reason: "refund"})
+	must(err)
+	if books, _ = gb.Banks.Books(ctx, bank.ID); books.FeeIncomeMinor != 0 {
+		t.Fatalf("fee not refunded: %d", books.FeeIncomeMinor)
+	}
+	inactive := "inactive"
+	if paused, err := cfg.Fees.Update(ctx, bank.ID, fee.ID, gamebank.UpdateFeeRuleParams{Status: &inactive}); err != nil || paused.State != gamebank.FeeStateInactive {
+		t.Fatalf("pause: %v", err)
+	}
+
 	_, err = gb.Clock.Configure(ctx, gamebank.ConfigureClockParams{Mode: "manual"})
 	must(err)
 	adv, err := gb.Clock.Advance(ctx, gamebank.AdvanceClockParams{Days: 1})
@@ -199,5 +266,19 @@ func TestContract(t *testing.T) {
 	must(err)
 	if !recon.OK {
 		t.Fatalf("reconciliation: %v", recon.Differences)
+	}
+
+	// Renaming and deleting a game. Deleting revokes its keys at once.
+	renamed, err := mgmt.Games.Update(ctx, game.ID, gamebank.UpdateGameParams{Name: "GO Game renamed"})
+	must(err)
+	if renamed.Name != "GO Game renamed" {
+		t.Fatalf("rename: %+v", renamed)
+	}
+	must(mgmt.Games.Delete(ctx, game.ID))
+	if _, err := mgmt.Games.Get(ctx, game.ID); !errors.Is(err, gamebank.ErrNotFound) {
+		t.Fatalf("deleted game: %v", err)
+	}
+	if _, err := gb.Clock.Get(ctx); !errors.Is(err, gamebank.ErrAuthentication) {
+		t.Fatalf("deleted game's key: %v", err)
 	}
 }
