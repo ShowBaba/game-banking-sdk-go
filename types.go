@@ -19,11 +19,16 @@ type Currency struct {
 }
 
 type Account struct {
-	ID                   string         `json:"id"`
-	BankID               string         `json:"bank_id"`
-	BankCode             string         `json:"bank_code"`
-	OwnerType            string         `json:"owner_type"`
-	PlayerID             *string        `json:"player_id"`
+	ID         string  `json:"id"`
+	BankID     string  `json:"bank_id"`
+	BankCode   string  `json:"bank_code"`
+	OwnerType  string  `json:"owner_type"`
+	PlayerID   *string `json:"player_id"`
+	MerchantID *string `json:"merchant_id"` // set on merchant accounts
+	// ProductID is the deposit product of a savings or fixed-deposit account.
+	ProductID *string `json:"product_id"`
+	// InterestAccountID receives the account's interest; nil pays the account itself.
+	InterestAccountID    *string        `json:"interest_account_id"`
 	SystemRole           *string        `json:"system_role"`
 	AccountType          string         `json:"account_type"`
 	AccountNumber        string         `json:"account_number"`
@@ -275,17 +280,23 @@ type UpsertPlayerParams struct {
 }
 
 type OpenAccountParams struct {
-	BankID      string         `json:"bank_id"`
-	PlayerID    string         `json:"player_id"`
-	AccountType string         `json:"account_type,omitempty"`
-	AccountName string         `json:"account_name,omitempty"`
-	Currency    string         `json:"currency,omitempty"`
-	Metadata    map[string]any `json:"metadata,omitempty"`
+	BankID string `json:"bank_id"`
+	// PlayerID opens a player account; MerchantID a merchant account, which receives card payments.
+	PlayerID   string `json:"player_id,omitempty"`
+	MerchantID string `json:"merchant_id,omitempty"`
+	// ProductID makes a savings account that earns interest under that product.
+	ProductID         string         `json:"product_id,omitempty"`
+	InterestAccountID string         `json:"interest_account_id,omitempty"`
+	AccountType       string         `json:"account_type,omitempty"`
+	AccountName       string         `json:"account_name,omitempty"`
+	Currency          string         `json:"currency,omitempty"`
+	Metadata          map[string]any `json:"metadata,omitempty"`
 }
 
 type ListAccountsParams struct {
 	BankID        string
 	PlayerID      string
+	MerchantID    string
 	IncludeSystem bool
 	Limit         int
 }
@@ -513,6 +524,12 @@ type BankBooks struct {
 	Currency           string `json:"currency"`
 	FeeIncomeMinor     int64  `json:"fee_income_minor"`
 	LeviesPayableMinor int64  `json:"levies_payable_minor"`
+	// InterestExpenseMinor is interest paid to savers (negative).
+	InterestExpenseMinor int64 `json:"interest_expense_minor"`
+	// AccruedInterestMinor is interest earned by savers, not yet paid.
+	AccruedInterestMinor int64 `json:"accrued_interest_minor"`
+	// FixedDepositsMinor is money in active fixed deposits.
+	FixedDepositsMinor int64 `json:"fixed_deposits_minor"`
 	Accounts           []struct {
 		SystemRole     string `json:"system_role"`
 		AccountName    string `json:"account_name"`
@@ -611,4 +628,11 @@ const (
 	ScopeFundingCreate      = "funding:create"
 	ScopeTransactionReverse = "transaction:reverse"
 	ScopeLimitsWrite        = "limits:write"
+	ScopeWebhooksRead       = "webhooks:read"
+	ScopeWebhooksWrite      = "webhooks:write"
+	ScopeMerchantsWrite     = "merchants:write"
+	ScopeCardsRead          = "cards:read"
+	ScopeCardsWrite         = "cards:write"
+	ScopeCardsCharge        = "cards:charge"
+	ScopeDepositsWrite      = "deposits:write"
 )

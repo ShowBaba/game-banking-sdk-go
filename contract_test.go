@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -27,6 +29,66 @@ func (l *lossyTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		return nil, errors.New("connection reset after the engine processed the request")
 	}
 	return res, err
+}
+
+// delivery is one webhook request a receiver got.
+type delivery struct {
+	header http.Header
+	body   []byte
+}
+
+// receiver is a local webhook endpoint that keeps each raw delivery. The
+// engine reaches it at GBE_WEBHOOK_RECEIVER_HOST (default host.docker.internal).
+type receiver struct {
+	url string
+	got chan delivery
+	srv *http.Server
+	all []delivery
+}
+
+func startReceiver(t *testing.T) *receiver {
+	t.Helper()
+	ln, err := net.Listen("tcp", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := os.Getenv("GBE_WEBHOOK_RECEIVER_HOST")
+	if host == "" {
+		host = "host.docker.internal"
+	}
+	r := &receiver{url: fmt.Sprintf("http://%s:%d/hooks", host, ln.Addr().(*net.TCPAddr).Port), got: make(chan delivery, 100)}
+	r.srv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		r.got <- delivery{header: req.Header.Clone(), body: body}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	go r.srv.Serve(ln) //nolint:errcheck
+	t.Cleanup(func() { r.srv.Close() })
+	return r
+}
+
+// waitFor returns the first delivery (old or new) whose body contains s.
+func (r *receiver) waitFor(t *testing.T, s string, fresh bool) delivery {
+	t.Helper()
+	if !fresh {
+		for _, d := range r.all {
+			if bytes.Contains(d.body, []byte(s)) {
+				return d
+			}
+		}
+	}
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case d := <-r.got:
+			r.all = append(r.all, d)
+			if bytes.Contains(d.body, []byte(s)) {
+				return d
+			}
+		case <-deadline:
+			t.Fatalf("no webhook delivery containing %q within 20s", s)
+		}
+	}
 }
 
 // TestContract runs the PRD §16.2 journey against a real engine when GBE_BASE_URL is set.
@@ -67,7 +129,9 @@ func TestContract(t *testing.T) {
 	game, err := mgmt.Games.Create(ctx, "GO Game "+uniq(), "")
 	must(err)
 	all := []string{gamebank.ScopeBankRead, gamebank.ScopeBankWrite, gamebank.ScopeAccountRead, gamebank.ScopeAccountWrite,
-		gamebank.ScopeTransferCreate, gamebank.ScopeFundingCreate, gamebank.ScopeTransactionReverse, gamebank.ScopeLimitsWrite}
+		gamebank.ScopeTransferCreate, gamebank.ScopeFundingCreate, gamebank.ScopeTransactionReverse, gamebank.ScopeLimitsWrite,
+		gamebank.ScopeWebhooksRead, gamebank.ScopeWebhooksWrite,
+		gamebank.ScopeMerchantsWrite, gamebank.ScopeCardsRead, gamebank.ScopeCardsWrite, gamebank.ScopeCardsCharge, gamebank.ScopeDepositsWrite}
 	key, err := mgmt.APIKeys.Issue(ctx, game.ID, gamebank.IssueAPIKeyParams{Environment: "sandbox", Label: "contract", Scopes: all})
 	must(err)
 	if !strings.HasPrefix(key.Secret, "gbe_test_sk_") {
@@ -255,6 +319,144 @@ func TestContract(t *testing.T) {
 		t.Fatalf("pause: %v", err)
 	}
 
+	// Webhooks: a debit alert reaches a real endpoint, signed, and verifies with the SDK helper.
+	if eps, err := mgmt.Game(game.ID, "sandbox").Webhooks.Endpoints.List(ctx); err != nil || len(eps) != 0 {
+		t.Fatalf("developer webhooks: %v %d", err, len(eps))
+	}
+	if _, err := ro.Webhooks.Endpoints.List(ctx); !errors.Is(err, gamebank.ErrPermissionDenied) {
+		t.Fatalf("webhooks scope: %v", err)
+	}
+	rc := startReceiver(t)
+	ep, err := gb.Webhooks.Endpoints.Create(ctx, gamebank.CreateWebhookEndpointParams{URL: rc.url, EventTypes: []string{gamebank.EventAccountDebited}, Description: "contract"})
+	must(err)
+	if !strings.HasPrefix(ep.Secret, ep.SecretPrefix) || ep.SecretPrefix == "" {
+		t.Fatalf("secret: %+v", ep)
+	}
+	if fetched, err := gb.Webhooks.Endpoints.Get(ctx, ep.ID); err != nil || fetched.Secret != "" {
+		t.Fatalf("the secret is shown once: %v", err)
+	}
+	probe, err := gb.Webhooks.Endpoints.Test(ctx, ep.ID)
+	must(err)
+	if probe.State != "delivered" {
+		t.Fatalf("test send: %+v (%v)", probe, probe.LastError)
+	}
+	sent, err := gb.Transfers.Create(ctx, gamebank.TransferParams{SourceAccountID: adaAcct.ID, DestinationAccountID: tundeAcct.ID, AmountMinor: 5_00, Narration: "Webhook check"})
+	must(err)
+	hit := rc.waitFor(t, sent.Transaction.ID, false)
+	event, err := gamebank.VerifyWebhook(hit.body, hit.header.Get(gamebank.WebhookSignatureHeader), ep.Secret)
+	must(err)
+	alert, err := event.Alert()
+	must(err)
+	if event.Type != gamebank.EventAccountDebited || alert.AccountID != adaAcct.ID || alert.TotalMinor != 5_00 ||
+		alert.Counterparty == nil || alert.Counterparty.AccountName != "Tunde Bello" ||
+		alert.BalanceAfter.PostedMinor != sent.SourceBalance.PostedBalance || hit.header.Get("GBE-Event-Id") != event.ID {
+		t.Fatalf("alert: %+v %+v", event, alert)
+	}
+	feed, err := gb.Webhooks.Events.List(ctx, gamebank.ListWebhookEventsParams{Type: gamebank.EventAccountDebited, AccountID: adaAcct.ID, Limit: 1})
+	must(err)
+	if len(feed.Data) != 1 || feed.Data[0].ID != event.ID {
+		t.Fatalf("feed: %+v", feed)
+	}
+	if got, err := gb.Webhooks.Events.Get(ctx, event.ID); err != nil || got.ID != event.ID {
+		t.Fatalf("get event: %v", err)
+	}
+	if ds, err := gb.Webhooks.Events.Deliveries(ctx, event.ID); err != nil || len(ds) != 1 || ds[0].State != "delivered" {
+		t.Fatalf("deliveries: %v %+v", err, ds)
+	}
+	rotated, err := gb.Webhooks.Endpoints.RotateSecret(ctx, ep.ID)
+	must(err)
+	if rotated.Secret == "" || rotated.Secret == ep.Secret || rotated.PreviousSecretExpiresAt == nil {
+		t.Fatalf("rotation: %+v", rotated)
+	}
+	_, err = gb.Webhooks.Events.Redeliver(ctx, event.ID, ep.ID)
+	must(err)
+	redelivered := rc.waitFor(t, sent.Transaction.ID, true)
+	verifier := gamebank.WebhookVerifier{Secrets: []string{rotated.Secret}}
+	if _, err := verifier.Verify(redelivered.body, redelivered.header.Get(gamebank.WebhookSignatureHeader)); err != nil {
+		t.Fatalf("new secret: %v", err)
+	}
+	if _, err := gamebank.VerifyWebhook(redelivered.body, redelivered.header.Get(gamebank.WebhookSignatureHeader), ep.Secret); err != nil {
+		t.Fatalf("old secret during the overlap: %v", err)
+	}
+	disabled := "disabled"
+	if up, err := gb.Webhooks.Endpoints.Update(ctx, ep.ID, gamebank.UpdateWebhookEndpointParams{Status: &disabled}); err != nil || up.Status != "disabled" {
+		t.Fatalf("disable: %v", err)
+	}
+	must(gb.Webhooks.Endpoints.Delete(ctx, ep.ID))
+	if _, err := gb.Webhooks.Endpoints.Get(ctx, ep.ID); !errors.Is(err, gamebank.ErrNotFound) {
+		t.Fatalf("deleted endpoint: %v", err)
+	}
+
+	// Merchants and cards: a shop with a merchant account, a card, a payment, a refund, a lost card.
+	shop, err := gb.Merchants.Create(ctx, gamebank.CreateMerchantParams{ExternalMerchantID: "shop-" + uniq(), Name: "Mama Put", Category: "food"})
+	must(err)
+	if again, err := gb.Merchants.Create(ctx, gamebank.CreateMerchantParams{ExternalMerchantID: shop.ExternalMerchantID, Name: "x"}); err != nil || again.ID != shop.ID {
+		t.Fatalf("merchants are idempotent: %v", err)
+	}
+	till, err := gb.Accounts.Open(ctx, gamebank.OpenAccountParams{BankID: bank.ID, MerchantID: shop.ID})
+	must(err)
+	if till.OwnerType != "merchant" || till.MerchantID == nil || *till.MerchantID != shop.ID {
+		t.Fatalf("merchant account: %+v", till)
+	}
+	_, err = cfg.Banks.Update(ctx, bank.ID, gamebank.UpdateBankParams{FeatureFlags: map[string]bool{"cards": true}})
+	must(err)
+	progName := "Classic"
+	program, err := cfg.CardPrograms.Create(ctx, bank.ID, gamebank.CardProgramParams{Name: &progName, DailyLimitMinor: i64(3_000_00)})
+	must(err)
+	if len(program.BIN) != 6 {
+		t.Fatalf("program: %+v", program)
+	}
+	issued, err := gb.Cards.Issue(ctx, gamebank.IssueCardParams{AccountID: adaAcct.ID, NameOnCard: "Ada Obi"})
+	must(err)
+	pan := issued.CardNumber
+	if len(pan) != 16 || issued.Card.MaskedNumber != pan[:6]+"******"+pan[12:] {
+		t.Fatalf("card: %+v", issued.Card)
+	}
+	cardBal, err := gb.Accounts.Balance(ctx, adaAcct.ID)
+	must(err)
+	spendable := cardBal.AvailableBalance
+	auth, err := gb.CardAuthorizations.Authorize(ctx, gamebank.AuthorizeCardParams{CardNumber: pan, ExpiryMonth: issued.Card.ExpiryMonth,
+		ExpiryYear: issued.Card.ExpiryYear, CVV: issued.CVV, MerchantAccountNumber: till.AccountNumber, AmountMinor: 200_00, Hold: true})
+	must(err)
+	if auth.Authorization.Status != "approved" || auth.Balance.AvailableBalance != spendable-200_00 {
+		t.Fatalf("authorize: %+v", auth.Authorization)
+	}
+	captured, err := gb.CardAuthorizations.Capture(ctx, auth.Authorization.ID, gamebank.CaptureCardParams{AmountMinor: 150_00})
+	must(err)
+	if captured.Transaction.Type != "card_payment" || captured.MerchantBalance.PostedBalance != 150_00 || captured.CardBalance.AvailableBalance != spendable-150_00 {
+		t.Fatalf("capture: %+v", captured)
+	}
+	refunded, err := gb.CardAuthorizations.Refund(ctx, auth.Authorization.ID, gamebank.RefundCardParams{AmountMinor: 50_00, Reason: "cold"})
+	must(err)
+	if refunded.Transaction.Type != "card_refund" || refunded.Authorization.RefundedMinor != 50_00 {
+		t.Fatalf("refund: %+v", refunded)
+	}
+	instant, err := gb.CardAuthorizations.Authorize(ctx, gamebank.AuthorizeCardParams{CardID: issued.Card.ID, MerchantAccountID: till.ID, AmountMinor: 20_00})
+	must(err)
+	if instant.Authorization.Status != "captured" || instant.Transaction == nil || instant.Transaction.Type != "card_payment" ||
+		instant.MerchantBalance == nil || instant.MerchantBalance.PostedBalance != 120_00 {
+		t.Fatalf("instant capture: %+v", instant)
+	}
+	pending, err := gb.CardAuthorizations.Authorize(ctx, gamebank.AuthorizeCardParams{CardID: issued.Card.ID, MerchantAccountID: till.ID, AmountMinor: 10_00, Hold: true})
+	must(err)
+	if lost, err := gb.Cards.ReportLost(ctx, issued.Card.ID, "stolen"); err != nil || lost.Status != gamebank.CardStolen {
+		t.Fatalf("report lost: %v", err)
+	}
+	refused, err := gb.CardAuthorizations.Authorize(ctx, gamebank.AuthorizeCardParams{CardID: issued.Card.ID, MerchantAccountID: till.ID, AmountMinor: 10_00})
+	must(err)
+	if code, declined := refused.Authorization.Declined(); !declined || code != gamebank.DeclineCardStolen {
+		t.Fatalf("decline: %+v", refused.Authorization)
+	}
+	if c, err := gb.CardAuthorizations.Capture(ctx, pending.Authorization.ID, gamebank.CaptureCardParams{}); err != nil || c.Authorization.Status != "captured" {
+		t.Fatalf("capture after loss: %v", err)
+	}
+	if cards, err := gb.Cards.List(ctx, gamebank.ListCardsParams{AccountID: adaAcct.ID}); err != nil || len(cards) != 1 {
+		t.Fatalf("no replacement card: %v %d", err, len(cards))
+	}
+	if auths, err := gb.CardAuthorizations.List(ctx, gamebank.ListCardAuthorizationsParams{CardID: issued.Card.ID}); err != nil || len(auths) != 4 {
+		t.Fatalf("authorizations: %v %d", err, len(auths))
+	}
+
 	_, err = gb.Clock.Configure(ctx, gamebank.ConfigureClockParams{Mode: "manual"})
 	must(err)
 	adv, err := gb.Clock.Advance(ctx, gamebank.AdvanceClockParams{Days: 1})
@@ -266,6 +468,48 @@ func TestContract(t *testing.T) {
 	must(err)
 	if !recon.OK {
 		t.Fatalf("reconciliation: %v", recon.Differences)
+	}
+
+	// Savings: ₦100,000 at 36.5% earns ₦100 a game day; a fixed deposit can be broken early.
+	_, err = cfg.Banks.Update(ctx, bank.ID, gamebank.UpdateBankParams{FeatureFlags: map[string]bool{"savings": true}})
+	must(err)
+	saver, err := cfg.DepositProducts.Create(ctx, bank.ID, gamebank.DepositProductParams{Code: "easy_saver", Name: "Easy Saver", Kind: "savings",
+		RateTiers: []gamebank.DepositTier{{FromMinor: 0, RateBPS: 3650}}})
+	must(err)
+	forfeit, penalty := 10_000, int64(100_00)
+	term, err := cfg.DepositProducts.Create(ctx, bank.ID, gamebank.DepositProductParams{Code: "term", Name: "Term Deposit", Kind: "fixed_deposit",
+		Terms: []gamebank.DepositTerm{{Days: 30, RateBPS: 3650}}, EarlyForfeitBPS: &forfeit, EarlyPenaltyFixedMinor: &penalty})
+	must(err)
+	savings, err := gb.Accounts.Open(ctx, gamebank.OpenAccountParams{BankID: bank.ID, PlayerID: ada.ID, ProductID: saver.ID})
+	must(err)
+	if savings.AccountType != "savings" {
+		t.Fatalf("savings account: %+v", savings)
+	}
+	_, err = gb.Funding.Create(ctx, gamebank.FundingParams{AccountID: savings.ID, AmountMinor: 100_000_00, Reason: "savings", Reference: "save-" + uniq()})
+	must(err)
+	_, err = gb.Funding.Create(ctx, gamebank.FundingParams{AccountID: adaAcct.ID, AmountMinor: 100_000_00, Reason: "deposit", Reference: "fd-" + uniq()})
+	must(err)
+	fd, err := gb.FixedDeposits.Open(ctx, gamebank.OpenFixedDepositParams{SourceAccountID: adaAcct.ID, ProductID: term.ID, TermDays: 30, AmountMinor: 100_000_00})
+	must(err)
+	if q, err := gb.DepositProducts.Quote(ctx, gamebank.DepositQuoteParams{ProductID: term.ID, AmountMinor: 100_000_00, TermDays: 30}); err != nil || q.GrossInterestMinor != 3_000_00 {
+		t.Fatalf("quote: %v %+v", err, q)
+	}
+	_, err = gb.Clock.Advance(ctx, gamebank.AdvanceClockParams{Days: 2})
+	must(err)
+	if in, err := gb.Accounts.Interest(ctx, savings.ID); err != nil || in.AccruedInterestMinor != 200_00 {
+		t.Fatalf("interest: %v %+v", err, in)
+	}
+	bq, err := gb.FixedDeposits.BreakQuote(ctx, fd.FixedDeposit.ID)
+	must(err)
+	if bq.PayoutMinor != 100_000_00-100_00 {
+		t.Fatalf("break quote: %+v", bq)
+	}
+	low := int64(50_00)
+	if _, err := gb.FixedDeposits.Break(ctx, fd.FixedDeposit.ID, &low); !errors.Is(err, gamebank.ErrPenaltyChanged) {
+		t.Fatalf("penalty cap: %v", err)
+	}
+	if br, err := gb.FixedDeposits.Break(ctx, fd.FixedDeposit.ID, &bq.PenaltyMinor); err != nil || br.FixedDeposit.Status != "broken" {
+		t.Fatalf("break: %v", err)
 	}
 
 	// Renaming and deleting a game. Deleting revokes its keys at once.

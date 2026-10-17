@@ -50,6 +50,7 @@ var (
 	ErrNotFound          error = kind("not found (404)")
 	ErrConflict          error = kind("conflict (409)")
 	ErrFeeChanged        error = kind("fees now exceed max_fee_minor")
+	ErrPenaltyChanged    error = kind("early-break penalty now exceeds max_penalty_minor")
 	ErrInvalidRequest    error = kind("invalid request (400, 413, 415)")
 	ErrUnprocessable     error = kind("business rule failed (422)")
 	ErrInsufficientFunds error = kind("insufficient funds")
@@ -75,6 +76,8 @@ func (e *Error) Is(target error) bool {
 		return e.Status == 409
 	case ErrFeeChanged:
 		return e.Status == 409 && e.Code == "fee_changed"
+	case ErrPenaltyChanged:
+		return e.Status == 409 && e.Code == "penalty_changed"
 	case ErrRateLimited:
 		return e.Status == 429
 	case ErrUnprocessable:

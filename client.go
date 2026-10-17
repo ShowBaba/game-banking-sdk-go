@@ -45,6 +45,14 @@ type Client struct {
 	Fees         *FeesService
 	Currencies   *CurrenciesService
 	Clock        *ClockService
+	Webhooks     *WebhooksService
+	Merchants    *MerchantsService
+	CardPrograms *CardProgramsService
+	Cards        *CardsService
+	// CardAuthorizations authorises, captures, releases and refunds card payments.
+	CardAuthorizations *CardAuthorizationsService
+	DepositProducts    *DepositProductsService
+	FixedDeposits      *FixedDepositsService
 }
 
 // NewClient builds a runtime client. Without options it reads GBE_API_KEY and GBE_BASE_URL.
@@ -62,6 +70,10 @@ func newClient(t *transport) *Client {
 		Players: &PlayersService{t}, Accounts: &AccountsService{t}, Funding: &FundingService{t},
 		Transfers: &TransfersService{t}, Holds: &HoldsService{t}, Transactions: &TransactionsService{t},
 		Banks: &BanksService{t}, Fees: &FeesService{t}, Currencies: &CurrenciesService{t}, Clock: &ClockService{t},
+		Webhooks:  &WebhooksService{Endpoints: &WebhookEndpointsService{t}, Events: &WebhookEventsService{t}},
+		Merchants: &MerchantsService{t}, CardPrograms: &CardProgramsService{t}, Cards: &CardsService{t},
+		CardAuthorizations: &CardAuthorizationsService{t},
+		DepositProducts:    &DepositProductsService{t}, FixedDeposits: &FixedDepositsService{t},
 	}
 }
 
@@ -116,6 +128,9 @@ func (s *AccountsService) List(ctx context.Context, p ListAccountsParams, opts .
 	}
 	if p.PlayerID != "" {
 		q.Set("player_id", p.PlayerID)
+	}
+	if p.MerchantID != "" {
+		q.Set("merchant_id", p.MerchantID)
 	}
 	if p.IncludeSystem {
 		q.Set("include_system", "true")

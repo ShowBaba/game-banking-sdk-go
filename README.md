@@ -64,6 +64,81 @@ _, err = gb.Fees.Create(ctx, bankID, gamebank.CreateFeeRuleParams{Code: "transfe
 books, err := gb.Banks.Books(ctx, bankID) // FeeIncomeMinor, LeviesPayableMinor
 ```
 
+## Merchants and cards
+
+```go
+// A shop and its merchant account (card payments settle here).
+shop, err := gb.Merchants.Create(ctx, gamebank.CreateMerchantParams{ExternalMerchantID: "shop:mama-put", Name: "Mama Put", Category: "food"})
+till, err := gb.Accounts.Open(ctx, gamebank.OpenAccountParams{BankID: bankID, MerchantID: shop.ID})
+
+// Once per bank: turn on cards and add a program (bank:write).
+_, err = gb.Banks.Update(ctx, bankID, gamebank.UpdateBankParams{FeatureFlags: map[string]bool{"cards": true}})
+name := "Classic"
+_, err = gb.CardPrograms.Create(ctx, bankID, gamebank.CardProgramParams{Name: &name})
+
+// Issue a card: CardNumber and CVV are shown only now.
+issued, err := gb.Cards.Issue(ctx, gamebank.IssueCardParams{AccountID: accountID})
+
+// Pay: an approved payment is charged at once (status "captured"). A decline is a result, not an error.
+paid, err := gb.CardAuthorizations.Authorize(ctx, gamebank.AuthorizeCardParams{CardID: issued.Card.ID, MerchantAccountID: till.ID, AmountMinor: 2_500_00})
+if code, declined := paid.Authorization.Declined(); declined {
+	showPlayer(code) // e.g. gamebank.DeclineInsufficientFunds
+}
+
+// Or hold first when the final amount or the sale isn't settled yet (a fuel pump, a pre-order).
+held, err := gb.CardAuthorizations.Authorize(ctx, gamebank.AuthorizeCardParams{CardID: issued.Card.ID, MerchantAccountID: till.ID, AmountMinor: 2_500_00, Hold: true})
+_, err = gb.CardAuthorizations.Capture(ctx, held.Authorization.ID, gamebank.CaptureCardParams{AmountMinor: 2_100_00}) // or Release; Refund later, in parts
+
+_, err = gb.Cards.ReportLost(ctx, issued.Card.ID, "stolen") // final; no replacement is issued
+```
+
+## Savings and fixed deposits
+
+```go
+// Once per bank: turn savings on and define products (bank:write).
+_, err = gb.Banks.Update(ctx, bankID, gamebank.UpdateBankParams{FeatureFlags: map[string]bool{"savings": true}})
+saver, err := gb.DepositProducts.Create(ctx, bankID, gamebank.DepositProductParams{Code: "easy_saver", Name: "Easy Saver", Kind: "savings",
+	RateTiers: []gamebank.DepositTier{{FromMinor: 0, RateBPS: 300}}})
+term, err := gb.DepositProducts.Create(ctx, bankID, gamebank.DepositProductParams{Code: "term", Name: "Term Deposit", Kind: "fixed_deposit",
+	Terms: []gamebank.DepositTerm{{Days: 90, RateBPS: 800}}})
+
+// A savings account earns daily on the game clock and is paid monthly.
+savings, err := gb.Accounts.Open(ctx, gamebank.OpenAccountParams{BankID: bankID, PlayerID: playerID, ProductID: saver.ID})
+position, err := gb.Accounts.Interest(ctx, savings.ID) // AccruedInterestMinor, NextPayoutDay, Payouts…
+
+// A fixed deposit (deposits:write); break it early with a quote first.
+fd, err := gb.FixedDeposits.Open(ctx, gamebank.OpenFixedDepositParams{SourceAccountID: accountID, ProductID: term.ID, TermDays: 90, AmountMinor: 50_000_00})
+quote, err := gb.FixedDeposits.BreakQuote(ctx, fd.FixedDeposit.ID)
+_, err = gb.FixedDeposits.Break(ctx, fd.FixedDeposit.ID, &quote.PenaltyMinor) // errors.Is(err, gamebank.ErrPenaltyChanged) if it rose
+```
+
+## Webhooks: debit and credit alerts
+
+Every money movement on a player's account sends a signed `account.debited` or `account.credited` event to your endpoint. Verify it with the **raw** body:
+
+```go
+// Register once (webhooks:write). The secret is shown only here.
+ep, err := gb.Webhooks.Endpoints.Create(ctx, gamebank.CreateWebhookEndpointParams{
+	URL: "https://game.example.com/gbe/webhooks", EventTypes: []string{gamebank.EventAccountDebited, gamebank.EventAccountCredited},
+})
+
+http.HandleFunc("POST /gbe/webhooks", func(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	event, err := gamebank.VerifyWebhook(body, r.Header.Get(gamebank.WebhookSignatureHeader), os.Getenv("GBE_WEBHOOK_SECRET"))
+	if err != nil { // errors.Is(err, gamebank.ErrWebhookVerification)
+		http.Error(w, "bad signature", http.StatusBadRequest)
+		return
+	}
+	if event.Type == gamebank.EventAccountDebited {
+		alert, _ := event.Alert() // AmountMinor, Charges, TotalMinor, BalanceAfter, Counterparty, Sequence…
+		notifyPlayer(alert.PlayerID, "-"+alert.TotalDisplay)
+	}
+	w.WriteHeader(http.StatusNoContent) // answer within 10s; delivery is at least once, so dedupe on event.ID
+})
+```
+
+`gb.Webhooks.Endpoints` also has `List`, `Get`, `Update` (Status `"disabled"` / `"active"`), `Delete`, `RotateSecret` (the old secret keeps signing for 24 hours; verify with both using `WebhookVerifier{Secrets: …}`) and `Test`. `gb.Webhooks.Events` has `List` / `Iterate` (the last 30 days, filterable by type and account, also a polling feed), `Get`, `Deliveries` and `Redeliver`.
+
 ## Setup and CI
 
 ```go
