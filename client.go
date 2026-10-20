@@ -2,7 +2,7 @@
 //
 // Keep game API keys on your servers; never ship them in a game client.
 //
-//	gb, err := gamebank.NewClient(gamebank.WithAPIKey(os.Getenv("GBE_API_KEY")), gamebank.WithBaseURL("https://engine.example.com"))
+//	gb, err := gamebank.NewClient(gamebank.WithAPIKey(os.Getenv("GBE_API_KEY"))) // talks to https://api.gamebank.dev
 //	res, err := gb.Transfers.Create(ctx, gamebank.TransferParams{SourceAccountID: a, DestinationAccountNumber: n, AmountMinor: 1000})
 package gamebank
 
@@ -34,7 +34,9 @@ func checkAmount(v int64, required bool) error {
 type Client struct {
 	t *transport
 	// Environment is "sandbox" or "production", read from the API key's prefix.
-	Environment  string
+	Environment string
+	// BaseURL is the engine this client talks to.
+	BaseURL      string
 	Players      *PlayersService
 	Accounts     *AccountsService
 	Funding      *FundingService
@@ -55,7 +57,8 @@ type Client struct {
 	FixedDeposits      *FixedDepositsService
 }
 
-// NewClient builds a runtime client. Without options it reads GBE_API_KEY and GBE_BASE_URL.
+// NewClient builds a runtime client. Without options it reads GBE_API_KEY, and
+// GBE_BASE_URL if set; otherwise it talks to the hosted engine (DefaultBaseURL).
 func NewClient(opts ...Option) (*Client, error) {
 	t, err := newTransport(opts)
 	if err != nil {
@@ -66,7 +69,7 @@ func NewClient(opts ...Option) (*Client, error) {
 
 func newClient(t *transport) *Client {
 	return &Client{
-		t: t, Environment: t.environment,
+		t: t, Environment: t.environment, BaseURL: t.cfg.baseURL,
 		Players: &PlayersService{t}, Accounts: &AccountsService{t}, Funding: &FundingService{t},
 		Transfers: &TransfersService{t}, Holds: &HoldsService{t}, Transactions: &TransactionsService{t},
 		Banks: &BanksService{t}, Fees: &FeesService{t}, Currencies: &CurrenciesService{t}, Clock: &ClockService{t},

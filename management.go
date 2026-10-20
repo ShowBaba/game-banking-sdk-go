@@ -11,7 +11,9 @@ import (
 // Management is the setup and CI client, authenticated with a developer
 // credential (gbe_dev_…) or a sign-in session token.
 type Management struct {
-	t           *transport
+	t *transport
+	// BaseURL is the engine this client talks to.
+	BaseURL     string
 	Games       *GamesService
 	APIKeys     *APIKeysService
 	Credentials *DeveloperCredentialsService
@@ -23,7 +25,7 @@ func NewManagement(opts ...Option) (*Management, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Management{t: t, Games: &GamesService{t}, APIKeys: &APIKeysService{t}, Credentials: &DeveloperCredentialsService{t}}, nil
+	return &Management{t: t, BaseURL: t.cfg.baseURL, Games: &GamesService{t}, APIKeys: &APIKeysService{t}, Credentials: &DeveloperCredentialsService{t}}, nil
 }
 
 // Me returns the developer this credential belongs to.

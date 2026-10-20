@@ -3,6 +3,8 @@
 Server-side SDK for the Game Banking Engine. Go 1.23+, standard library only.
 
 > Game API keys move money. Use this SDK on your game servers only.
+>
+> In-game money only: the Game Banking Engine simulates banking for game currencies. It holds no real money and isn't a regulated financial service, so don't use it for balances players can cash out or exchange for real money.
 
 ## Install
 
@@ -15,10 +17,7 @@ go get github.com/ShowBaba/game-banking-sdk-go
 ```go
 import gamebank "github.com/ShowBaba/game-banking-sdk-go"
 
-gb, err := gamebank.NewClient(
-	gamebank.WithAPIKey(os.Getenv("GBE_API_KEY")),
-	gamebank.WithBaseURL("https://your-engine.example.com"),
-)
+gb, err := gamebank.NewClient(gamebank.WithAPIKey(os.Getenv("GBE_API_KEY"))) // talks to https://api.gamebank.dev
 
 player, err := gb.Players.Upsert(ctx, gamebank.UpsertPlayerParams{ExternalPlayerID: "user-42", DisplayName: "Ada Obi"})
 account, err := gb.Accounts.Open(ctx, gamebank.OpenAccountParams{BankID: bankID, PlayerID: player.ID})
@@ -142,7 +141,7 @@ http.HandleFunc("POST /gbe/webhooks", func(w http.ResponseWriter, r *http.Reques
 ## Setup and CI
 
 ```go
-mgmt, _ := gamebank.NewManagement(gamebank.WithAPIKey(os.Getenv("GBE_DEV_CREDENTIAL")), gamebank.WithBaseURL(baseURL))
+mgmt, _ := gamebank.NewManagement(gamebank.WithAPIKey(os.Getenv("GBE_DEV_CREDENTIAL")))
 game, _ := mgmt.Games.Create(ctx, "Lagos Hustle", "")
 key, _ := mgmt.APIKeys.Issue(ctx, game.ID, gamebank.IssueAPIKeyParams{Environment: "sandbox"})
 fmt.Println(key.Secret) // shown once

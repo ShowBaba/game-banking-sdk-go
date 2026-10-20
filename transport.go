@@ -51,7 +51,12 @@ type config struct {
 // WithAPIKey sets the game API key or developer credential (default: GBE_API_KEY).
 func WithAPIKey(key string) Option { return func(c *config) { c.apiKey = key } }
 
-// WithBaseURL sets the engine's address (default: GBE_BASE_URL).
+// DefaultBaseURL is the hosted engine. Override it with WithBaseURL or
+// GBE_BASE_URL for a local or self-hosted engine.
+const DefaultBaseURL = "https://api.gamebank.dev"
+
+// WithBaseURL sets the engine's address (default: GBE_BASE_URL, then DefaultBaseURL).
+// Set it only for a local or self-hosted engine.
 func WithBaseURL(u string) Option { return func(c *config) { c.baseURL = u } }
 
 // WithTimeout sets the per-attempt timeout (default 30s).
@@ -99,12 +104,12 @@ func newTransport(opts []Option) (*transport, error) {
 	if c.baseURL == "" {
 		c.baseURL = os.Getenv("GBE_BASE_URL")
 	}
+	if c.baseURL == "" {
+		c.baseURL = DefaultBaseURL
+	}
 	c.apiKey = strings.TrimSpace(c.apiKey)
 	if c.apiKey == "" {
 		return nil, &Error{Code: "missing_api_key", Message: "pass WithAPIKey or set GBE_API_KEY"}
-	}
-	if c.baseURL == "" {
-		return nil, &Error{Code: "missing_base_url", Message: "pass WithBaseURL (your engine's address) or set GBE_BASE_URL"}
 	}
 	c.baseURL = strings.TrimRight(c.baseURL, "/")
 	if c.httpClient == nil {

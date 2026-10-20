@@ -89,13 +89,16 @@ func TestConfiguration(t *testing.T) {
 	if _, err := NewClient(WithBaseURL("http://e")); err == nil {
 		t.Fatal("missing key accepted")
 	}
-	if _, err := NewClient(WithAPIKey("gbe_test_sk_x")); err == nil {
-		t.Fatal("missing base URL accepted")
+	if c, err := NewClient(WithAPIKey("gbe_test_sk_x")); err != nil || c.BaseURL != "https://api.gamebank.dev" {
+		t.Fatalf("default base URL: %v %v", c, err)
 	}
 	t.Setenv("GBE_API_KEY", "gbe_live_sk_env")
 	t.Setenv("GBE_BASE_URL", "http://env")
-	if c, err := NewClient(); err != nil || c.Environment != "production" {
+	if c, err := NewClient(); err != nil || c.Environment != "production" || c.BaseURL != "http://env" {
 		t.Fatalf("env fallback: %v", err)
+	}
+	if c, _ := NewClient(WithBaseURL("http://explicit/")); c.BaseURL != "http://explicit" {
+		t.Fatalf("explicit base URL: %s", c.BaseURL)
 	}
 }
 
